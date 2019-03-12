@@ -18,3 +18,7 @@
 //! This module provides a threaded ContextManager.
 
 mod core;
+
+pub use crate::context::manager::thread::core::{
+    ContextOperationMessage, ContextOperationResponse,
+};

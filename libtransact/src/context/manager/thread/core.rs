@@ -18,7 +18,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 
-use crate::context::{manager::ContextManager, ContextId};
+use crate::context::{error::ContextManagerCoreError, manager::ContextManager, ContextId};
 use crate::protocol::receipt::{Event, TransactionReceipt};
 use crate::state::Read;
 
@@ -110,7 +110,7 @@ impl ContextManagerCore {
         }
     }
 
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), ContextManagerCoreError> {
         loop {
             match self.core_receiver.recv() {
                 Ok(ContextOperationMessage::GetTransactionReceipt { .. }) => {
@@ -138,18 +138,20 @@ impl ContextManagerCore {
                     break;
                 }
                 Err(err) => {
-                    error!("ContextManagerCore recv error: {}", err);
-                    break;
+                    return Err(ContextManagerCoreError::CoreReceiveError(err));
                 }
             }
         }
+        Ok(())
     }
 
     fn start(mut self) -> std::thread::JoinHandle<()> {
         thread::Builder::new()
             .name(String::from("Thread-ContextManager"))
             .spawn(move || {
-                self.run();
+                if let Err(err) = self.run() {
+                    error!("ContextManagerCore ended due to error: {}", err);
+                }
             })
             .expect("Could not build a thread for Context Manager")
     }
