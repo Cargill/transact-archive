@@ -34,7 +34,6 @@ use std::sync::{
     Arc,
 };
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use log::warn;
 
@@ -62,16 +61,17 @@ pub enum RegistrationChange {
 
 /// One of either a `RegistrationChange` or an `ExecutionEvent`.
 /// The single internal thread in the Executor is listening for these.
-pub enum RegistrationExecutionEvent {
+pub enum ExecutorCommand {
     RegistrationChange(RegistrationChange),
     Execution(Box<ExecutionEvent>),
+    Shutdown,
 }
 
 ///`RegistrationChange` and `ExecutionEvent` multiplex sender
-pub type RegistrationExecutionEventSender = Sender<RegistrationExecutionEvent>;
+pub type ExecutorCommandSender = Sender<ExecutorCommand>;
 
 ///`RegistrationChange` and `ExecutionEvent` multiplex sender
-pub type RegistrationExecutionEventReceiver = Receiver<RegistrationExecutionEvent>;
+pub type ExecutorCommandReceiver = Receiver<ExecutorCommand>;
 
 /// Sender part of a channel to send from the internal looping thread to the `ExecutionAdapter`
 pub type ExecutionEventSender = Sender<ExecutionCommand>;
@@ -151,7 +151,7 @@ pub struct ExecutorThread {
     execution_adapters: Vec<Box<ExecutionAdapter>>,
     join_handles: Vec<JoinHandle<()>>,
     internal_thread: Option<JoinHandle<()>>,
-    sender: Option<RegistrationExecutionEventSender>,
+    sender: Option<ExecutorCommandSender>,
     stop: Arc<AtomicBool>,
 }
 
@@ -166,7 +166,7 @@ impl ExecutorThread {
         }
     }
 
-    pub fn sender(&self) -> Option<RegistrationExecutionEventSender> {
+    pub fn sender(&self) -> Option<ExecutorCommandSender> {
         self.sender.as_ref().cloned()
     }
 
@@ -220,11 +220,18 @@ impl ExecutorThread {
         }
     }
 
-    pub fn stop(self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(internal) = self.internal_thread {
-            if let Err(err) = internal.join() {
-                warn!("During stop of executor thread: {:?}", err);
+    pub fn stop(mut self) {
+        if let Some(sender) = self.sender.take() {
+            self.stop.store(true, Ordering::Relaxed);
+
+            if let Err(err) = sender.send(ExecutorCommand::Shutdown) {
+                warn!("Unable to send shutdown signal to executor thread: {}", err);
+            }
+
+            if let Some(internal) = self.internal_thread.take() {
+                if let Err(err) = internal.join() {
+                    warn!("During stop of executor thread: {:?}", err);
+                }
             }
         }
     }
@@ -233,7 +240,7 @@ impl ExecutorThread {
         stop: Arc<AtomicBool>,
         execution_adapter: Box<ExecutionAdapter>,
         receiver: ExecutionEventReceiver,
-        sender: &RegistrationExecutionEventSender,
+        sender: &ExecutorCommandSender,
         index: usize,
     ) -> Result<JoinHandle<()>, std::io::Error> {
         let sender = sender.clone();
@@ -241,7 +248,7 @@ impl ExecutorThread {
         std::thread::Builder::new()
             .name(format!("execution_adapter_thread_{}", index))
             .spawn(move || loop {
-                if let Ok(execution_command) = receiver.recv_timeout(Duration::from_millis(200)) {
+                if let Ok(execution_command) = receiver.recv() {
                     match execution_command {
                         ExecutionCommand::Event(execution_event) => {
                             let sender = sender.clone();
@@ -260,11 +267,9 @@ impl ExecutorThread {
                                         let execution_task =
                                             ExecutionTask::new(*transaction_pair, context_id);
                                         let execution_event = (completion_notifier, execution_task);
-                                        if let Err(err) =
-                                            sender.send(RegistrationExecutionEvent::Execution(
-                                                Box::new(execution_event),
-                                            ))
-                                        {
+                                        if let Err(err) = sender.send(ExecutorCommand::Execution(
+                                            Box::new(execution_event),
+                                        )) {
                                             warn!("During retry of TimeOutError: {}", err);
                                         }
                                     }
@@ -272,11 +277,9 @@ impl ExecutorThread {
                                         let execution_task =
                                             ExecutionTask::new(*transaction_pair, context_id);
                                         let execution_event = (completion_notifier, execution_task);
-                                        if let Err(err) =
-                                            sender.send(RegistrationExecutionEvent::Execution(
-                                                Box::new(execution_event),
-                                            ))
-                                        {
+                                        if let Err(err) = sender.send(ExecutorCommand::Execution(
+                                            Box::new(execution_event),
+                                        )) {
                                             warn!("During retry of RoutingError: {}", err);
                                         }
                                     }
@@ -309,7 +312,7 @@ impl ExecutorThread {
 
     fn start_thread(
         &self,
-        receiver: RegistrationExecutionEventReceiver,
+        receiver: ExecutorCommandReceiver,
     ) -> Result<JoinHandle<()>, std::io::Error> {
         let stop = Arc::clone(&self.stop);
         std::thread::Builder::new()
@@ -330,68 +333,84 @@ impl ExecutorThread {
                         );
                     }
 
-                    if let Ok(reg_execution_event) =
-                        receiver.recv_timeout(Duration::from_millis(200))
-                    {
-                        match reg_execution_event {
-                            RegistrationExecutionEvent::Execution(execution_event) => {
-                                Self::try_send_execution_event(
-                                    execution_event,
-                                    &fanout_threads,
-                                    &mut parked,
-                                )
+                    match receiver.recv() {
+                        Ok(ExecutorCommand::Execution(execution_event)) => {
+                            if stop.load(Ordering::Relaxed) {
+                                Self::shutdown_fanout_threads(&fanout_threads);
+                                break;
                             }
-                            RegistrationExecutionEvent::RegistrationChange(
-                                RegistrationChange::RegisterRequest((transaction_family, sender)),
-                            ) => {
-                                if let Some(p) = parked.get_mut(&transaction_family) {
-                                    unparked.append(p);
-                                }
-                                let found = if let Some(ea_senders) =
-                                    fanout_threads.get_mut(&transaction_family)
-                                {
-                                    ea_senders.insert(sender);
-                                    None
-                                } else {
-                                    let mut s = HashSet::new();
-                                    s.insert(sender);
-                                    Some(s)
-                                };
+                            Self::try_send_execution_event(
+                                execution_event,
+                                &fanout_threads,
+                                &mut parked,
+                            )
+                        }
+                        Ok(ExecutorCommand::RegistrationChange(
+                            RegistrationChange::RegisterRequest((transaction_family, sender)),
+                        )) => {
+                            if stop.load(Ordering::Relaxed) {
+                                Self::shutdown_fanout_threads(&fanout_threads);
+                                break;
+                            }
 
-                                if let Some(f) = found {
-                                    fanout_threads.insert(transaction_family, f);
-                                }
+                            if let Some(p) = parked.get_mut(&transaction_family) {
+                                unparked.append(p);
                             }
-                            RegistrationExecutionEvent::RegistrationChange(
-                                RegistrationChange::UnregisterRequest((transaction_family, sender)),
-                            ) => {
-                                fanout_threads
-                                    .entry(transaction_family)
-                                    .and_modify(|ea_senders| {
-                                        ea_senders.remove(&sender);
-                                    });
+
+                            let found = if let Some(ea_senders) =
+                                fanout_threads.get_mut(&transaction_family)
+                            {
+                                ea_senders.insert(sender);
+                                None
+                            } else {
+                                let mut s = HashSet::new();
+                                s.insert(sender);
+                                Some(s)
+                            };
+
+                            if let Some(f) = found {
+                                fanout_threads.insert(transaction_family, f);
                             }
                         }
-                    } else if stop.load(Ordering::Relaxed) {
-                        for sender in
+                        Ok(ExecutorCommand::RegistrationChange(
+                            RegistrationChange::UnregisterRequest((transaction_family, sender)),
+                        )) => {
                             fanout_threads
-                                .values()
-                                .fold(HashSet::new(), |mut set, item| {
-                                    for s in item {
-                                        set.insert(s);
-                                    }
-                                    set
-                                })
-                        {
-                            if let Err(err) = sender.sender.send(ExecutionCommand::Sentinel) {
-                                warn!("During stop of ExecutorThread internal thread: {}", err);
-                            }
+                                .entry(transaction_family)
+                                .and_modify(|ea_senders| {
+                                    ea_senders.remove(&sender);
+                                });
                         }
 
-                        break;
+                        Ok(ExecutorCommand::Shutdown) => {
+                            Self::shutdown_fanout_threads(&fanout_threads);
+                            break;
+                        }
+                        Err(err) => {
+                            error!("Received error while processing executor commands: {}", err);
+                            break;
+                        }
                     }
                 }
             })
+    }
+
+    fn shutdown_fanout_threads(
+        fanout_threads: &HashMap<TransactionFamily, HashSet<NamedExecutionEventSender>>,
+    ) {
+        for sender in fanout_threads
+            .values()
+            .fold(HashSet::new(), |mut set, item| {
+                for s in item {
+                    set.insert(s);
+                }
+                set
+            })
+        {
+            if let Err(err) = sender.sender.send(ExecutionCommand::Sentinel) {
+                warn!("During stop of ExecutorThread internal thread: {}", err);
+            }
+        }
     }
 
     fn try_send_execution_event(
@@ -470,9 +489,9 @@ mod tests {
             Box::new(ChannelExecutionTaskCompletionNotifier { tx: sender });
 
         let (registration_execution_event_sender, internal_receiver): (
-            RegistrationExecutionEventSender,
-            RegistrationExecutionEventReceiver,
-        ) = channel::<RegistrationExecutionEvent>();
+            ExecutorCommandSender,
+            ExecutorCommandReceiver,
+        ) = channel::<ExecutorCommand>();
 
         let (execution_adapter_sender, receiver) = channel::<ExecutionCommand>();
 
@@ -480,7 +499,7 @@ mod tests {
 
         let tf = TransactionFamily::new(FAMILY_NAME.to_string(), FAMILY_VERSION.to_string());
         let named_sender = NamedExecutionEventSender::new(execution_adapter_sender, 0);
-        let registration_event = RegistrationExecutionEvent::RegistrationChange(
+        let registration_event = ExecutorCommand::RegistrationChange(
             RegistrationChange::RegisterRequest((tf, named_sender)),
         );
 
@@ -494,7 +513,7 @@ mod tests {
 
         for reg_ex_event in execution_tasks
             .map(|execution_task| (notifier.clone(), execution_task))
-            .map(|execution_event| RegistrationExecutionEvent::Execution(Box::new(execution_event)))
+            .map(|execution_event| ExecutorCommand::Execution(Box::new(execution_event)))
         {
             registration_execution_event_sender
                 .send(reg_ex_event)
@@ -510,7 +529,7 @@ mod tests {
 
         while let Ok(event) = internal_receiver.try_recv() {
             match event {
-                RegistrationExecutionEvent::Execution(execution_event) => {
+                ExecutorCommand::Execution(execution_event) => {
                     let (_, execution_state) = execution_event.as_ref();
 
                     let tf = TransactionFamily::from_pair(execution_state.pair());
@@ -549,38 +568,38 @@ mod tests {
                         }
                     }
                 }
-                RegistrationExecutionEvent::RegistrationChange(registration_event) => {
-                    match registration_event {
-                        RegistrationChange::RegisterRequest((tf, sender)) => {
-                            parked_transaction_map
-                                .entry(tf.clone())
-                                .and_modify(|parked| {
-                                    for p in parked.drain(0..) {
-                                        unparked_transactions.push(p);
-                                    }
-                                });
-                            let senders_option = match named_senders.get_mut(&tf) {
-                                Some(senders) => {
-                                    senders.insert(sender);
-                                    None
+                ExecutorCommand::RegistrationChange(registration_event) => match registration_event
+                {
+                    RegistrationChange::RegisterRequest((tf, sender)) => {
+                        parked_transaction_map
+                            .entry(tf.clone())
+                            .and_modify(|parked| {
+                                for p in parked.drain(0..) {
+                                    unparked_transactions.push(p);
                                 }
-                                None => {
-                                    let mut s = HashSet::new();
-                                    s.insert(sender);
-                                    Some(s)
-                                }
-                            };
-                            if let Some(senders) = senders_option {
-                                named_senders.insert(tf, senders);
-                            }
-                        }
-                        RegistrationChange::UnregisterRequest((tf, sender)) => {
-                            named_senders.entry(tf).and_modify(|senders| {
-                                senders.remove(&sender);
                             });
+                        let senders_option = match named_senders.get_mut(&tf) {
+                            Some(senders) => {
+                                senders.insert(sender);
+                                None
+                            }
+                            None => {
+                                let mut s = HashSet::new();
+                                s.insert(sender);
+                                Some(s)
+                            }
+                        };
+                        if let Some(senders) = senders_option {
+                            named_senders.insert(tf, senders);
                         }
                     }
-                }
+                    RegistrationChange::UnregisterRequest((tf, sender)) => {
+                        named_senders.entry(tf).and_modify(|senders| {
+                            senders.remove(&sender);
+                        });
+                    }
+                },
+                ExecutorCommand::Shutdown => panic!("Should not have called shutdown during test"),
             }
         }
 
@@ -634,7 +653,7 @@ mod tests {
 
         for reg_ex_event in execution_tasks
             .map(|execution_task| (notifier.clone(), execution_task))
-            .map(|execution_event| RegistrationExecutionEvent::Execution(Box::new(execution_event)))
+            .map(|execution_event| ExecutorCommand::Execution(Box::new(execution_event)))
         {
             sender
                 .send(reg_ex_event)
@@ -650,8 +669,10 @@ mod tests {
 
         let mut results = vec![];
 
-        while let Ok(result) = receiver.recv_timeout(Duration::from_millis(200)) {
-            results.push(result);
+        for _ in 0..NUMBER_OF_TRANSACTIONS {
+            if let Ok(result) = receiver.recv() {
+                results.push(result);
+            }
         }
 
         assert_eq!(
@@ -712,7 +733,7 @@ mod tests {
 }
 
 struct InternalRegistry {
-    registry_sender: RegistrationExecutionEventSender,
+    registry_sender: ExecutorCommandSender,
     event_sender: NamedExecutionEventSender,
 }
 
@@ -720,7 +741,7 @@ impl ExecutionRegistry for InternalRegistry {
     fn register_transaction_family(&mut self, family: TransactionFamily) {
         if let Err(err) = self
             .registry_sender
-            .send(RegistrationExecutionEvent::RegistrationChange(
+            .send(ExecutorCommand::RegistrationChange(
                 RegistrationChange::RegisterRequest((family, self.event_sender.clone())),
             ))
         {
@@ -734,7 +755,7 @@ impl ExecutionRegistry for InternalRegistry {
     fn unregister_transaction_family(&mut self, family: &TransactionFamily) {
         if let Err(err) = self
             .registry_sender
-            .send(RegistrationExecutionEvent::RegistrationChange(
+            .send(ExecutorCommand::RegistrationChange(
                 RegistrationChange::UnregisterRequest((family.clone(), self.event_sender.clone())),
             ))
         {
