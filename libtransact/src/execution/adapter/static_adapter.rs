@@ -21,7 +21,7 @@
 use std::sync::mpsc::{channel, Sender};
 use std::thread;
 
-use crate::context::manager::sync::ContextManager;
+use crate::context::manager::thread::ContextManager;
 use crate::context::manager::ContextManagerError;
 use crate::context::ContextId;
 use crate::execution::adapter::{ExecutionAdapter, ExecutionAdapterError, ExecutionOperationError};
@@ -231,7 +231,7 @@ impl<'a, 'b> TransactionContext for StaticContext<'a, 'b> {
         addresses: &[String],
     ) -> Result<Vec<(String, Vec<u8>)>, ContextError> {
         self.context_manager
-            .get(self.context_id, addresses)
+            .get_state(self.context_id, addresses)
             .map_err(ContextError::from)
     }
 
@@ -300,7 +300,7 @@ mod test {
         Arc,
     };
 
-    use crate::context::ContextLifecycle;
+    use crate::context::manager::thread::ContextManagerJoinHandle;
     use crate::scheduler::{ExecutionTaskCompletionNotification, InvalidTransactionResult};
     use crate::state::hashmap::HashMapState;
     use crate::workload::command::{make_command_transaction, Command, CommandTransactionHandler};
@@ -313,7 +313,7 @@ mod test {
         let state = HashMapState::new();
         let state_id = HashMapState::state_id(&HashMap::new());
 
-        let mut context_manager: ContextManager = ContextManager::new(Box::new(state));
+        let (join_handle, context_manager) = ContextManagerJoinHandle::new(Box::new(state));
 
         let handler = CommandTransactionHandler::new();
 
@@ -329,7 +329,7 @@ mod test {
             value: b"abc".to_vec(),
         }]);
         let txn_id = txn_pair.transaction().header_signature().into();
-        let context_id = context_manager.create_context(&[], &state_id);
+        let context_id = context_manager.create_context(&[], &state_id).unwrap();
 
         let (send, recv) = std::sync::mpsc::channel();
         assert!(static_adapter
@@ -350,10 +350,10 @@ mod test {
         assert_eq!(
             vec![("abc".to_owned(), b"abc".to_vec())],
             context_manager
-                .get(&context_id, &["abc".to_owned()])
+                .get_state(&context_id, &["abc".to_owned()])
                 .unwrap()
         );
-
+        assert!(join_handle.shutdown().is_ok());
         assert!(Box::new(static_adapter).stop().is_ok());
     }
 
@@ -364,8 +364,7 @@ mod test {
 
         let state = HashMapState::new();
         let state_id = HashMapState::state_id(&HashMap::new());
-
-        let mut context_manager: ContextManager = ContextManager::new(Box::new(state));
+        let (join_handle, context_manager) = ContextManagerJoinHandle::new(Box::new(state));
 
         let handler = CommandTransactionHandler::new();
 
@@ -386,7 +385,7 @@ mod test {
         ]);
 
         let txn_id = txn_pair.transaction().header_signature().to_owned();
-        let context_id = context_manager.create_context(&[], &state_id);
+        let context_id = context_manager.create_context(&[], &state_id).unwrap();
 
         let (send, recv) = std::sync::mpsc::channel();
         assert!(static_adapter
@@ -412,6 +411,7 @@ mod test {
             result.unwrap()
         );
 
+        assert!(join_handle.shutdown().is_ok());
         assert!(Box::new(static_adapter).stop().is_ok());
     }
 
