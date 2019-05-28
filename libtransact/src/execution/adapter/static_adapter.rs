@@ -300,7 +300,7 @@ mod test {
         Arc,
     };
 
-    use crate::context::manager::thread::ContextManagerJoinHandle;
+    use crate::context::{manager::thread::ContextManagerJoinHandle, ContextLifecycle};
     use crate::scheduler::{ExecutionTaskCompletionNotification, InvalidTransactionResult};
     use crate::state::hashmap::HashMapState;
     use crate::workload::command::{make_command_transaction, Command, CommandTransactionHandler};
