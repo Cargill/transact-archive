@@ -46,7 +46,7 @@ impl ContextManager {
 
     /// Returns a ContextId of the newly created Context.
     pub fn create_context(
-        &self,
+        &mut self,
         dependent_contexts: &[ContextId],
         state_id: &str,
     ) -> Result<ContextId, ContextManagerError> {
@@ -78,7 +78,7 @@ impl ContextManager {
     }
 
     /// Drops the specified context from the ContextManager.
-    pub fn drop_context(&self, _context_id: ContextId) {
+    pub fn drop_context(&mut self, _context_id: ContextId) {
         unimplemented!();
     }
 
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn test_context_lifecycle() {
         let state = HashMapState::new();
-        let (join_handle, context_manager) = ContextManagerJoinHandle::new(Box::new(state));
+        let (join_handle, mut context_manager) = ContextManagerJoinHandle::new(Box::new(state));
 
         let state_id = HashMapState::state_id(&HashMap::new());
 
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn test_context_state_changes() {
         let state = HashMapState::new();
-        let (join_handle, context_manager) = ContextManagerJoinHandle::new(Box::new(state));
+        let (join_handle, mut context_manager) = ContextManagerJoinHandle::new(Box::new(state));
         let state_id = HashMapState::state_id(&HashMap::new());
 
         let context_id = context_manager.create_context(&[], &state_id).unwrap();
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn test_multi_thread_integration() {
         let state = HashMapState::new();
-        let (join_handle, context_manager) = ContextManagerJoinHandle::new(Box::new(state));
+        let (join_handle, mut context_manager) = ContextManagerJoinHandle::new(Box::new(state));
         let state_id = HashMapState::state_id(&HashMap::new());
 
         let context_id = context_manager.create_context(&[], &state_id).unwrap();
