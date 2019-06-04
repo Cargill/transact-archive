@@ -20,7 +20,7 @@
 mod core;
 
 pub use crate::context::manager::thread::core::{
-    ContextOperationMessage, ContextOperationResponse,
+    ContextManagerJoinHandle, ContextOperationMessage, ContextOperationResponse,
 };
 
 use std::sync::mpsc;
