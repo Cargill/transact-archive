@@ -297,7 +297,9 @@ mod tests {
             unimplemented!()
         }
 
-        fn drop_context(&mut self, _context_id: ContextId) {}
+        fn drop_context(&mut self, _context_id: ContextId) -> Result<(), ContextManagerError> {
+            unimplemented!()
+        }
     }
 
     pub fn test_scheduler(scheduler: &mut Scheduler) {
