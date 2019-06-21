@@ -261,4 +261,14 @@ mod tests {
         test_scheduler_flow_with_one_transaction(&mut scheduler);
         scheduler.shutdown();
     }
+
+    #[test]
+    pub fn test_serial_scheduler_flow_with_multiple_transactions() {
+        let state_id = String::from("state0");
+        let context_lifecycle = Box::new(MockContextLifecycle::new());
+        let mut scheduler =
+            SerialScheduler::new(context_lifecycle, state_id).expect("Failed to create scheduler");
+        test_scheduler_flow_with_multiple_transactions(&mut scheduler);
+        scheduler.shutdown();
+    }
 }
